@@ -1,0 +1,21 @@
+[workspace]
+authors = ["gifdog97 <omusubset.s@gmail.com>"]
+channels = ["conda-forge"]
+name = "longtail_asr"
+platforms = ["linux-64", "osx-arm64"]
+version = "0.1.0"
+
+[dependencies]
+
+[feature.gpu.system-requirements]
+cuda = "12.2"
+
+[feature.gpu.target.linux-64.dependencies]
+pytorch-gpu = "*"
+
+[environments]
+default = []
+gpu = ["gpu"]
+
+[tasks]
+
