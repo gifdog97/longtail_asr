@@ -29,7 +29,6 @@ from transformers import (
     pipeline,
 )
 
-
 DEFAULT_MODEL_IDS = (
     "openai/whisper-large-v3",
     "openai/whisper-large-v3-turbo",
@@ -62,9 +61,7 @@ MODEL_SPECS = {
     ),
     "facebook/mms-1b-all": ModelSpec("facebook/mms-1b-all", "mms_ctc"),
     "espnet/owsm_ctc_v4_1B": ModelSpec("espnet/owsm_ctc_v4_1B", "hf_pipeline"),
-    "espnet/owsm_v4_medium_1B": ModelSpec(
-        "espnet/owsm_v4_medium_1B", "hf_pipeline"
-    ),
+    "espnet/owsm_v4_medium_1B": ModelSpec("espnet/owsm_v4_medium_1B", "hf_pipeline"),
     "facebook/hubert-large-ls960-ft": ModelSpec(
         "facebook/hubert-large-ls960-ft", "hf_pipeline"
     ),
@@ -97,7 +94,7 @@ def safe_model_filename(model_id: str) -> str:
     return f"{normalized}.csv"
 
 
-def torch_dtype_for_device(device: str) -> torch.dtype:
+def dtype_for_device(device: str) -> torch.dtype:
     return torch.float16 if device.startswith("cuda") else torch.float32
 
 
@@ -121,12 +118,12 @@ def build_asr_pipeline(
     language: str,
 ) -> tuple[Any, dict[str, Any]]:
     spec = get_model_spec(model_id, backend)
-    torch_dtype = torch_dtype_for_device(device)
+    dtype = dtype_for_device(device)
 
     if spec.backend == "whisper":
         model = AutoModelForSpeechSeq2Seq.from_pretrained(
             model_id,
-            torch_dtype=torch_dtype,
+            dtype=dtype,
             low_cpu_mem_usage=True,
             use_safetensors=True,
         )
@@ -137,7 +134,7 @@ def build_asr_pipeline(
             model=model,
             tokenizer=processor.tokenizer,
             feature_extractor=processor.feature_extractor,
-            torch_dtype=torch_dtype,
+            dtype=dtype,
             device=device,
         )
         generate_kwargs = {
@@ -151,7 +148,7 @@ def build_asr_pipeline(
         processor = AutoProcessor.from_pretrained(model_id, target_lang=target_lang)
         model = AutoModelForCTC.from_pretrained(
             model_id,
-            torch_dtype=torch_dtype,
+            dtype=dtype,
             low_cpu_mem_usage=True,
         )
         if hasattr(model, "load_adapter"):
@@ -166,7 +163,7 @@ def build_asr_pipeline(
             model=model,
             tokenizer=processor.tokenizer,
             feature_extractor=processor.feature_extractor,
-            torch_dtype=torch_dtype,
+            dtype=dtype,
             device=device,
         )
         return pipe, {}
@@ -175,7 +172,7 @@ def build_asr_pipeline(
         pipe = pipeline(
             "automatic-speech-recognition",
             model=model_id,
-            torch_dtype=torch_dtype,
+            dtype=dtype,
             device=device,
             trust_remote_code=True,
         )
@@ -191,14 +188,18 @@ def build_asr_pipeline(
     raise ValueError(msg)
 
 
-def batch_rows(batch: dict[str, list[Any]], split_name: str) -> tuple[list[str], list[Any]]:
+def batch_rows(
+    batch: dict[str, list[Any]], split_name: str
+) -> tuple[list[str], list[Any]]:
     keys = [str(key) for key in batch["__key__"]]
     if "ogg" not in batch:
         raise KeyError(f"Expected an 'ogg' audio column in split {split_name}.")
     return keys, list(batch["ogg"])
 
 
-def iter_dataset_batches(dataset: Any, batch_size: int) -> Iterable[dict[str, list[Any]]]:
+def iter_dataset_batches(
+    dataset: Any, batch_size: int
+) -> Iterable[dict[str, list[Any]]]:
     if hasattr(dataset, "iter"):
         yield from dataset.iter(batch_size=batch_size)
         return
