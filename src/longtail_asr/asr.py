@@ -46,13 +46,14 @@ def main():
     num_samples = num_all_samples()
     pbar = tqdm(total=num_samples, desc="ASR on Swuggy", unit="sample")
     with open("results.txt", "w") as f:
-        f.write("key,asr\n")
-        for sample in ds:
-            key = sample["__key__"]
-            audio = sample["ogg"]  # bytes; decode with soundfile/librosa as needed
-            result = pipe(audio)
-            f.write(f"{key},{result['text']}\n")
-            pbar.update(1)
+        f.write("key,asr,split_name\n")
+        for split_name, split_ds in ds.items():
+            for sample in split_ds:
+                key = sample["__key__"]
+                audio = sample["ogg"]  # bytes; decode with soundfile/librosa as needed
+                result = pipe(audio)
+                f.write(f"{key},{result['text'].strip()},{split_name}\n")
+                pbar.update(1)
 
 
 if __name__ == "__main__":
