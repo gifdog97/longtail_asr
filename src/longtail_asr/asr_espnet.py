@@ -1,10 +1,8 @@
 """
-Run ASR over sWUGGY and write one CSV-like result file per model.
+Run ESPnet ASR over sWUGGY and write one CSV-like result file per model.
 
-The default command starts one worker per visible CUDA device. Each worker
-loads the requested model, shards each Hugging Face Dataset split by
-rank/world_size, runs batched ASR, and writes a temporary part file. The parent
-process merges those part files into the final model-named output file.
+This is intentionally separate from asr.py so the ESPnet pixi environment does
+not need the Hugging Face Transformers ASR stack.
 """
 
 from __future__ import annotations
@@ -14,7 +12,6 @@ import os
 import re
 import subprocess
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -22,46 +19,70 @@ import polars as pl
 import torch
 from datasets import load_dataset
 from tqdm import tqdm
-from transformers import (
-    AutoModelForCTC,
-    AutoModelForSpeechSeq2Seq,
-    AutoProcessor,
-    pipeline,
-)
 
 DEFAULT_MODEL_IDS = (
-    "openai/whisper-large-v3",
-    "openai/whisper-large-v3-turbo",
-    "facebook/seamless-m4t-v2-large",
-    "facebook/mms-1b-all",
-    "facebook/hubert-large-ls960-ft",
+    "espnet/owsm_ctc_v4_1B",
+    "espnet/owsm_v4_medium_1B",
 )
-
 SWUGGY_TESTSETS = (1, 2, 4, 8, 16, 32, 64)
-LANGUAGE_TO_MMS = {"en": "eng", "fr": "fra"}
-LANGUAGE_TO_WHISPER = {"en": "english", "fr": "french"}
-LANGUAGE_TO_SEAMLESS = {"en": "eng", "fr": "fra"}
+LANGUAGE_TO_ESPNET = {"en": "<eng>", "fr": "<fra>"}
+ESPNET_SAMPLE_RATE = 16_000
 
 
-@dataclass(frozen=True)
-class ModelSpec:
-    model_id: str
-    backend: str
+class EspnetCTCASR:
+    def __init__(
+        self,
+        model_id: str,
+        *,
+        device: str,
+        language: str,
+        context_len_in_secs: int = 4,
+    ) -> None:
+        from espnet2.bin.s2t_inference_ctc import Speech2TextGreedySearch
+
+        self.s2t = Speech2TextGreedySearch.from_pretrained(
+            model_id,
+            device=device,
+            use_flash_attn=False,
+            lang_sym=espnet_language_symbol(language),
+            task_sym="<asr>",
+        )
+        self.context_len_in_secs = context_len_in_secs
+
+    def __call__(self, audios: list[Any], *, batch_size: int) -> list[dict[str, str]]:
+        inputs = [espnet_audio_input(audio) for audio in audios]
+        results = self.s2t.batch_decode(
+            inputs,
+            batch_size=batch_size,
+            context_len_in_secs=self.context_len_in_secs,
+        )
+        if isinstance(results, str):
+            results = [results]
+        return [{"text": text} for text in results]
 
 
-MODEL_SPECS = {
-    "openai/whisper-large-v3": ModelSpec("openai/whisper-large-v3", "whisper"),
-    "openai/whisper-large-v3-turbo": ModelSpec(
-        "openai/whisper-large-v3-turbo", "whisper"
-    ),
-    "facebook/seamless-m4t-v2-large": ModelSpec(
-        "facebook/seamless-m4t-v2-large", "hf_pipeline"
-    ),
-    "facebook/mms-1b-all": ModelSpec("facebook/mms-1b-all", "mms_ctc"),
-    "facebook/hubert-large-ls960-ft": ModelSpec(
-        "facebook/hubert-large-ls960-ft", "hf_pipeline"
-    ),
-}
+class EspnetS2TASR:
+    def __init__(self, model_id: str, *, device: str, language: str) -> None:
+        from espnet2.bin.s2t_inference import Speech2Text
+
+        self.s2t = Speech2Text.from_pretrained(
+            model_tag=model_id,
+            device=device,
+            beam_size=5,
+            ctc_weight=0.0,
+            maxlenratio=0.0,
+            lang_sym=espnet_language_symbol(language),
+            task_sym="<asr>",
+            predict_time=False,
+        )
+
+    def __call__(self, audios: list[Any], *, batch_size: int) -> list[dict[str, str]]:
+        del batch_size
+        return [{"text": self.decode_one(audio)} for audio in audios]
+
+    def decode_one(self, audio: Any) -> str:
+        result = self.s2t(espnet_audio_input(audio))[0]
+        return str(result[-2])
 
 
 def num_all_samples(language: str) -> int:
@@ -90,98 +111,96 @@ def safe_model_filename(model_id: str) -> str:
     return f"{normalized}.csv"
 
 
-def dtype_for_device(device: str) -> torch.dtype:
-    return torch.float16 if device.startswith("cuda") else torch.float32
+def espnet_language_symbol(language: str) -> str:
+    if language.startswith("<") and language.endswith(">"):
+        return language
+    return LANGUAGE_TO_ESPNET.get(language, f"<{language}>")
 
 
-def get_model_spec(model_id: str, backend: str) -> ModelSpec:
+def espnet_audio_input(audio: Any) -> Any:
+    sampling_rate = None
+    if isinstance(audio, dict):
+        sampling_rate = audio.get("sampling_rate")
+        if "array" in audio:
+            audio = audio["array"]
+        elif "raw" in audio:
+            audio = audio["raw"]
+
+    if isinstance(audio, torch.Tensor):
+        audio = mono_audio(audio.detach().cpu())
+        if sampling_rate and sampling_rate != ESPNET_SAMPLE_RATE:
+            audio = resample_audio(audio, sampling_rate, ESPNET_SAMPLE_RATE)
+        return audio.numpy()
+
+    if isinstance(audio, (list, tuple)):
+        audio = torch.as_tensor(audio)
+        audio = mono_audio(audio)
+        if sampling_rate and sampling_rate != ESPNET_SAMPLE_RATE:
+            audio = resample_audio(audio, sampling_rate, ESPNET_SAMPLE_RATE)
+        return audio.numpy()
+
+    if is_array_like_audio(audio) and audio.ndim > 1:
+        audio = mono_audio(audio)
+    if (
+        is_array_like_audio(audio)
+        and sampling_rate
+        and sampling_rate != ESPNET_SAMPLE_RATE
+    ):
+        audio = resample_audio(
+            torch.as_tensor(audio),
+            sampling_rate,
+            ESPNET_SAMPLE_RATE,
+        ).numpy()
+
+    return audio
+
+
+def is_array_like_audio(audio: Any) -> bool:
+    return hasattr(audio, "ndim") and hasattr(audio, "mean")
+
+
+def mono_audio(audio: Any) -> Any:
+    if audio.ndim <= 1:
+        return audio
+    channel_axis = -1 if audio.shape[-1] <= audio.shape[0] else 0
+    if isinstance(audio, torch.Tensor):
+        return audio.mean(dim=channel_axis)
+    return audio.mean(axis=channel_axis)
+
+
+def resample_audio(
+    audio: torch.Tensor,
+    source_sample_rate: int,
+    target_sample_rate: int,
+) -> torch.Tensor:
+    import torchaudio.functional as F
+
+    return F.resample(audio.float(), source_sample_rate, target_sample_rate)
+
+
+def get_backend(model_id: str, backend: str) -> str:
     if backend != "auto":
-        return ModelSpec(model_id, backend)
-    if model_id in MODEL_SPECS:
-        return MODEL_SPECS[model_id]
-    if "whisper" in model_id:
-        return ModelSpec(model_id, "whisper")
-    if "mms-1b" in model_id:
-        return ModelSpec(model_id, "mms_ctc")
-    return ModelSpec(model_id, "hf_pipeline")
+        return backend
+    if "ctc" in model_id:
+        return "espnet_ctc"
+    return "espnet_s2t"
 
 
-def build_asr_pipeline(
+def build_asr(
     model_id: str,
     *,
     backend: str,
     device: str,
     language: str,
-) -> tuple[Any, dict[str, Any]]:
-    spec = get_model_spec(model_id, backend)
-    dtype = dtype_for_device(device)
-
-    if spec.backend == "whisper":
-        model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            model_id,
-            dtype=dtype,
-            low_cpu_mem_usage=True,
-            use_safetensors=True,
-        )
-        model.to(device)
-        processor = AutoProcessor.from_pretrained(model_id)
-        pipe = pipeline(
-            "automatic-speech-recognition",
-            model=model,
-            tokenizer=processor.tokenizer,
-            feature_extractor=processor.feature_extractor,
-            dtype=dtype,
-            device=device,
-        )
-        generate_kwargs = {
-            "task": "transcribe",
-            "language": LANGUAGE_TO_WHISPER.get(language, language),
-        }
-        return pipe, {"generate_kwargs": generate_kwargs}
-
-    if spec.backend == "mms_ctc":
-        target_lang = LANGUAGE_TO_MMS.get(language, language)
-        processor = AutoProcessor.from_pretrained(model_id, target_lang=target_lang)
-        model = AutoModelForCTC.from_pretrained(
-            model_id,
-            dtype=dtype,
-            low_cpu_mem_usage=True,
-        )
-        if hasattr(model, "load_adapter"):
-            model.load_adapter(target_lang)
-        if hasattr(processor, "tokenizer") and hasattr(
-            processor.tokenizer, "set_target_lang"
-        ):
-            processor.tokenizer.set_target_lang(target_lang)
-        model.to(device)
-        pipe = pipeline(
-            "automatic-speech-recognition",
-            model=model,
-            tokenizer=processor.tokenizer,
-            feature_extractor=processor.feature_extractor,
-            dtype=dtype,
-            device=device,
-        )
-        return pipe, {}
-
-    if spec.backend == "hf_pipeline":
-        pipe = pipeline(
-            "automatic-speech-recognition",
-            model=model_id,
-            dtype=dtype,
-            device=device,
-            trust_remote_code=True,
-        )
-        generate_kwargs: dict[str, Any] = {}
-        if "seamless-m4t" in model_id:
-            generate_kwargs["tgt_lang"] = LANGUAGE_TO_SEAMLESS.get(language, language)
-        return pipe, {"generate_kwargs": generate_kwargs} if generate_kwargs else {}
-
-    msg = (
-        f"Unsupported backend '{spec.backend}'. "
-        "Use one of: auto, whisper, mms_ctc, hf_pipeline."
+) -> Any:
+    backend = get_backend(model_id, backend)
+    if backend == "espnet_ctc":
+        return EspnetCTCASR(model_id, device=device, language=language)
+    if backend == "espnet_s2t":
+        return EspnetS2TASR(model_id, device=device, language=language)
+    raise ValueError(
+        f"Unsupported backend '{backend}'. Use one of: auto, espnet_ctc, espnet_s2t."
     )
-    raise ValueError(msg)
 
 
 def batch_rows(
@@ -221,7 +240,7 @@ def shard_dataset(dataset: Any, *, rank: int, world_size: int) -> Any:
 
 def run_worker(args: argparse.Namespace) -> None:
     device = args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
-    pipe, call_kwargs = build_asr_pipeline(
+    asr = build_asr(
         args.model_id,
         backend=args.backend,
         device=device,
@@ -235,7 +254,7 @@ def run_worker(args: argparse.Namespace) -> None:
 
     progress = tqdm(
         total=total,
-        desc=f"ASR rank {args.rank}/{args.world_size} on {Path(args.part_file).name}",
+        desc=f"ESPnet ASR rank {args.rank}/{args.world_size} on {Path(args.part_file).name}",
         unit="sample",
     )
     with open(args.part_file, "w") as f:
@@ -247,13 +266,7 @@ def run_worker(args: argparse.Namespace) -> None:
             )
             for batch in iter_dataset_batches(worker_ds, args.batch_size):
                 keys, audios = batch_rows(batch, split_name)
-                results = pipe(
-                    audios,
-                    batch_size=args.batch_size,
-                    **call_kwargs,
-                )
-                if isinstance(results, dict):
-                    results = [results]
+                results = asr(audios, batch_size=args.batch_size)
                 for key, result in zip(keys, results, strict=True):
                     f.write(f"{key},{result['text'].strip()},{split_name}\n")
                 progress.update(len(keys))
@@ -343,14 +356,14 @@ def run_parent(args: argparse.Namespace) -> None:
             failures.append((rank, returncode))
     if failures:
         details = ", ".join(f"rank {rank}: {code}" for rank, code in failures)
-        raise RuntimeError(f"ASR worker failed ({details}).")
+        raise RuntimeError(f"ESPnet ASR worker failed ({details}).")
 
     merge_part_files(part_files, output_file)
     print(f"Wrote {output_file}")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run batched ASR on sWUGGY.")
+    parser = argparse.ArgumentParser(description="Run ESPnet ASR on sWUGGY.")
     subparsers = parser.add_subparsers(dest="command")
 
     run = subparsers.add_parser("run", help="Run ASR and merge worker outputs.")
@@ -358,12 +371,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--backend",
         default="auto",
-        choices=(
-            "auto",
-            "whisper",
-            "mms_ctc",
-            "hf_pipeline",
-        ),
+        choices=("auto", "espnet_ctc", "espnet_s2t"),
     )
     run.add_argument("--language", default="en", choices=("en", "fr"))
     run.add_argument("--batch-size", type=int, default=16)
@@ -383,12 +391,7 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument(
         "--backend",
         default="auto",
-        choices=(
-            "auto",
-            "whisper",
-            "mms_ctc",
-            "hf_pipeline",
-        ),
+        choices=("auto", "espnet_ctc", "espnet_s2t"),
     )
     worker.add_argument("--language", default="en", choices=("en", "fr"))
     worker.add_argument("--batch-size", type=int, default=16)

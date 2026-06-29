@@ -6,14 +6,30 @@ platforms = ["linux-64", "osx-arm64"]
 version = "0.1.0"
 
 [dependencies]
+polars = ">=1.42.0,<2"
+tqdm = ">=4.68.3,<5"
+datasets = ">=5.0.0,<6"
+
+[feature.hf.dependencies]
 python = "==3.12.0"
 huggingface_hub = ">=1.20.1,<2"
-datasets = ">=5.0.0,<6"
 transformers = ">=5.12.1,<6"
 torchcodec = ">=0.14.0,<0.15"
 torchaudio = ">=2.11.0,<3"
+
+[feature.espnet]
+platforms = ["linux-64"]
+
+[feature.espnet.dependencies]
+python = "3.11.*"
+setuptools = ">=38.5.1,<74.0.0"
+datasets = ">=5.0.0,<6"
 polars = ">=1.42.0,<2"
 tqdm = ">=4.68.3,<5"
+torchaudio = "*"
+
+[feature.espnet.pypi-dependencies]
+espnet = { path = "./espnet", editable = true }
 
 [feature.gpu.system-requirements]
 cuda = "12.2"
@@ -22,8 +38,9 @@ cuda = "12.2"
 pytorch-gpu = "*"
 
 [environments]
-default = []
-gpu = ["gpu"]
+default = ["hf"]
+gpu = ["hf", "gpu"]
+espnet = { features = ["espnet"], no-default-feature = true }
+espnet-gpu = { features = ["espnet", "gpu"], no-default-feature = true }
 
 [tasks]
-
