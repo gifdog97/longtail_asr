@@ -17,9 +17,6 @@ transformers = ">=5.12.1,<6"
 torchcodec = ">=0.14.0,<0.15"
 torchaudio = ">=2.11.0,<3"
 
-[feature.espnet]
-platforms = ["linux-64"]
-
 [feature.espnet.dependencies]
 python = "3.11.*"
 setuptools = ">=38.5.1,<74.0.0"
@@ -30,12 +27,14 @@ torchaudio = "*"
 
 [feature.espnet.pypi-dependencies]
 espnet = { path = "./espnet", editable = true }
+soundfile = "*"
 
 [feature.gpu.system-requirements]
 cuda = "12.2"
 
 [feature.gpu.target.linux-64.dependencies]
 pytorch-gpu = "*"
+flash-attn = "*"
 
 [environments]
 default = ["hf"]

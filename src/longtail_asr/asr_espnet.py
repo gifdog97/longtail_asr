@@ -8,6 +8,7 @@ not need the Hugging Face Transformers ASR stack.
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import re
 import subprocess
@@ -15,9 +16,13 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable
 
+import numpy as np
 import polars as pl
+import soundfile as sf
 import torch
 from datasets import load_dataset
+from espnet2.bin.s2t_inference import Speech2Text
+from espnet2.bin.s2t_inference_ctc import Speech2TextGreedySearch
 from tqdm import tqdm
 
 DEFAULT_MODEL_IDS = (
@@ -26,7 +31,6 @@ DEFAULT_MODEL_IDS = (
 )
 SWUGGY_TESTSETS = (1, 2, 4, 8, 16, 32, 64)
 LANGUAGE_TO_ESPNET = {"en": "<eng>", "fr": "<fra>"}
-ESPNET_SAMPLE_RATE = 16_000
 
 
 class EspnetCTCASR:
@@ -38,8 +42,6 @@ class EspnetCTCASR:
         language: str,
         context_len_in_secs: int = 4,
     ) -> None:
-        from espnet2.bin.s2t_inference_ctc import Speech2TextGreedySearch
-
         self.s2t = Speech2TextGreedySearch.from_pretrained(
             model_id,
             device=device,
@@ -50,6 +52,8 @@ class EspnetCTCASR:
         self.context_len_in_secs = context_len_in_secs
 
     def __call__(self, audios: list[Any], *, batch_size: int) -> list[dict[str, str]]:
+        print(type(audios))
+        print(audios)
         inputs = [espnet_audio_input(audio) for audio in audios]
         results = self.s2t.batch_decode(
             inputs,
@@ -63,8 +67,6 @@ class EspnetCTCASR:
 
 class EspnetS2TASR:
     def __init__(self, model_id: str, *, device: str, language: str) -> None:
-        from espnet2.bin.s2t_inference import Speech2Text
-
         self.s2t = Speech2Text.from_pretrained(
             model_tag=model_id,
             device=device,
@@ -118,64 +120,42 @@ def espnet_language_symbol(language: str) -> str:
 
 
 def espnet_audio_input(audio: Any) -> Any:
-    sampling_rate = None
+    return audio.get_all_samples().data.numpy()
+    # speech, _ = read_audio_with_soundfile(audio)
+    # return speech
+
+
+def read_audio_with_soundfile(audio: Any) -> tuple[Any, int | None]:
+    return sf.read(io.BytesIO(audio))
     if isinstance(audio, dict):
-        sampling_rate = audio.get("sampling_rate")
+        if audio.get("path"):
+            return read_soundfile(audio["path"])
+        if "bytes" in audio:
+            return read_soundfile(io.BytesIO(audio["bytes"]))
+        if "raw" in audio and isinstance(audio["raw"], bytes):
+            return read_soundfile(io.BytesIO(audio["raw"]))
         if "array" in audio:
-            audio = audio["array"]
-        elif "raw" in audio:
-            audio = audio["raw"]
+            return normalize_speech_array(audio["array"]), audio.get("sampling_rate")
+        if "raw" in audio:
+            return normalize_speech_array(audio["raw"]), audio.get("sampling_rate")
 
-    if isinstance(audio, torch.Tensor):
-        audio = mono_audio(audio.detach().cpu())
-        if sampling_rate and sampling_rate != ESPNET_SAMPLE_RATE:
-            audio = resample_audio(audio, sampling_rate, ESPNET_SAMPLE_RATE)
-        return audio.numpy()
-
-    if isinstance(audio, (list, tuple)):
-        audio = torch.as_tensor(audio)
-        audio = mono_audio(audio)
-        if sampling_rate and sampling_rate != ESPNET_SAMPLE_RATE:
-            audio = resample_audio(audio, sampling_rate, ESPNET_SAMPLE_RATE)
-        return audio.numpy()
-
-    if is_array_like_audio(audio) and audio.ndim > 1:
-        audio = mono_audio(audio)
-    if (
-        is_array_like_audio(audio)
-        and sampling_rate
-        and sampling_rate != ESPNET_SAMPLE_RATE
-    ):
-        audio = resample_audio(
-            torch.as_tensor(audio),
-            sampling_rate,
-            ESPNET_SAMPLE_RATE,
-        ).numpy()
-
-    return audio
+    if isinstance(audio, (str, os.PathLike)):
+        return read_soundfile(audio)
+    if isinstance(audio, bytes):
+        return read_soundfile(io.BytesIO(audio))
+    return normalize_speech_array(audio), None
 
 
-def is_array_like_audio(audio: Any) -> bool:
-    return hasattr(audio, "ndim") and hasattr(audio, "mean")
+def read_soundfile(file: Any) -> tuple[Any, int]:
+    speech, rate = sf.read(file, dtype="float32")
+    return speech, rate
 
 
-def mono_audio(audio: Any) -> Any:
-    if audio.ndim <= 1:
-        return audio
-    channel_axis = -1 if audio.shape[-1] <= audio.shape[0] else 0
-    if isinstance(audio, torch.Tensor):
-        return audio.mean(dim=channel_axis)
-    return audio.mean(axis=channel_axis)
-
-
-def resample_audio(
-    audio: torch.Tensor,
-    source_sample_rate: int,
-    target_sample_rate: int,
-) -> torch.Tensor:
-    import torchaudio.functional as F
-
-    return F.resample(audio.float(), source_sample_rate, target_sample_rate)
+def normalize_speech_array(audio: Any) -> Any:
+    speech = np.asarray(audio, dtype="float32")
+    if speech.ndim > 1:
+        speech = speech.mean(axis=1)
+    return speech
 
 
 def get_backend(model_id: str, backend: str) -> str:
