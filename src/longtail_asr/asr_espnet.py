@@ -52,8 +52,6 @@ class EspnetCTCASR:
         self.context_len_in_secs = context_len_in_secs
 
     def __call__(self, audios: list[Any], *, batch_size: int) -> list[dict[str, str]]:
-        print(type(audios))
-        print(audios)
         inputs = [espnet_audio_input(audio) for audio in audios]
         results = self.s2t.batch_decode(
             inputs,
@@ -120,13 +118,14 @@ def espnet_language_symbol(language: str) -> str:
 
 
 def espnet_audio_input(audio: Any) -> Any:
-    return audio.get_all_samples().data.numpy()
-    # speech, _ = read_audio_with_soundfile(audio)
-    # return speech
+    speech, _ = read_audio(audio)
+    return speech
 
 
-def read_audio_with_soundfile(audio: Any) -> tuple[Any, int | None]:
-    return sf.read(io.BytesIO(audio))
+def read_audio(audio: Any) -> tuple[Any, int | None]:
+    if hasattr(audio, "get_all_samples"):
+        return read_torchcodec_audio(audio)
+
     if isinstance(audio, dict):
         if audio.get("path"):
             return read_soundfile(audio["path"])
@@ -146,16 +145,39 @@ def read_audio_with_soundfile(audio: Any) -> tuple[Any, int | None]:
     return normalize_speech_array(audio), None
 
 
-def read_soundfile(file: Any) -> tuple[Any, int]:
-    speech, rate = sf.read(file, dtype="float32")
+def read_torchcodec_audio(audio: Any) -> tuple[Any, int | None]:
+    samples = audio.get_all_samples()
+    speech = normalize_speech_array(samples.data, channel_first=True)
+    rate = getattr(samples, "sample_rate", None)
+    if rate is None and hasattr(audio, "metadata"):
+        rate = getattr(audio.metadata, "sample_rate", None)
     return speech, rate
 
 
-def normalize_speech_array(audio: Any) -> Any:
+def read_soundfile(file: Any) -> tuple[Any, int]:
+    speech, rate = sf.read(file, dtype="float32")
+    return normalize_speech_array(speech), rate
+
+
+def normalize_speech_array(audio: Any, *, channel_first: bool = False) -> Any:
+    if isinstance(audio, torch.Tensor):
+        audio = audio.detach().cpu().numpy()
+
     speech = np.asarray(audio, dtype="float32")
-    if speech.ndim > 1:
-        speech = speech.mean(axis=1)
-    return speech
+    if speech.ndim == 0:
+        raise ValueError("Expected audio samples, got a scalar.")
+
+    if speech.ndim > 2:
+        speech = np.squeeze(speech)
+    if speech.ndim == 2:
+        if channel_first:
+            speech = speech.mean(axis=0)
+        else:
+            speech = speech.mean(axis=1)
+    elif speech.ndim != 1:
+        raise ValueError(f"Expected 1D or 2D audio samples, got shape {speech.shape}.")
+
+    return np.ascontiguousarray(speech, dtype=np.float32)
 
 
 def get_backend(model_id: str, backend: str) -> str:
