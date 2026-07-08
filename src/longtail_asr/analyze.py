@@ -17,6 +17,10 @@ import csv
 from dataclasses import dataclass
 from pathlib import Path
 
+import jiwer
+import matplotlib.pyplot as plt
+import numpy as np
+
 
 @dataclass
 class ASRItem:
@@ -116,12 +120,50 @@ def parse_asr_output(
     return asr_items
 
 
+def group_items(asr_items: list[ASRItem]) -> dict[str, dict[str, str | list[str]]]:
+    # initial implementation: word-level
+    grouped_data = {}
+    for item in asr_items:
+        if not item.is_word:
+            continue
+        word = item.gold
+        if word not in grouped_data:
+            grouped_data[word] = {
+                "asr": [],
+                "frequency": item.frequency,
+                "frequency_gold": item.frequency_gold,
+            }
+        grouped_data[word]["asr"].append(item.asr)
+    for word, data in grouped_data.items():
+        cer = jiwer.cer(data["asr"], [word] * len(data["asr"]))
+        data["cer"] = cer
+    return grouped_data
+
+
+def plot_logfreq_cer(grouped_data: dict[str, dict[str, str | list[str]]]) -> None:
+    frequencies = []
+    cers = []
+    for word, data in grouped_data.items():
+        frequencies.append(data["frequency"])
+        cers.append(data["cer"])
+
+    log_frequencies = np.log10(np.array(frequencies) + 1)  # Add 1 to avoid log(0)
+    plt.scatter(log_frequencies, cers)
+    plt.xlabel("Log Frequency")
+    plt.ylabel("Character Error Rate (CER)")
+    plt.title("Log Frequency vs CER")
+    plt.grid(True)
+    plt.savefig("logfreq_cer_plot.svg")
+    plt.close()
+
+
 def main() -> None:
     args = parse_args()
     frequency_data = load_frequency_data(args.frequency_dir)
     gold_data = load_gold_data(args.gold_csv)
     asr_items = parse_asr_output(args.asr_output, gold_data, frequency_data)
-    print(asr_items[100])
+    grouped_data = group_items(asr_items)
+    plot_logfreq_cer(grouped_data)
 
 
 if __name__ == "__main__":
